@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""fetch — minimal system information tool with gitpkg integration."""
+
+import os
+import platform
+import subprocess
+import sys
+import argparse
+from pathlib import Path
+from typing import Optional
+
+
+# -- File / process helpers --
+
+def read_file(path: str) -> Optional[str]:
+    """Read file contents. Returns None on any filesystem error."""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def run_cmd(cmd: list[str], timeout: int = 5) -> Optional[str]:
+    """Run command, return stripped stdout. Returns None on failure.
+
+    Uses list form — no shell expansion, no injection.
+    """
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+        return None
+
+# -- Paranoid mode helpers --
+
+_KNOWN_CPU_BRANDS = ("Intel", "AMD", "Apple", "Qualcomm", "Broadcom", "ARM", "NVIDIA")
+
+def extract_cpu_brand(full_name: str) -> str:
+    """Reduce 'AMD Ryzen 9 7950X 16-Core Processor' → 'AMD'."""
+    name_lower = full_name.lower()
+    for brand in _KNOWN_CPU_BRANDS:
+        if brand.lower() in name_lower:
+            return brand
+    return "Unknown"
+
+
+def memory_range(total_mib: int) -> str:
+    """Map exact total to a power-of-2 bucket range in GiB.
+
+    e.g. 15906 MiB (~15.5 GiB) → '8-16 GiB'
+    """
+    total_gib = total_mib / 1024
+    lower = 8
+    while lower < total_gib:
+        lower *= 2
+    upper = lower
+    lower //= 2
+    if lower < 8:
+        return f"≤8 GiB"
+    return f"{lower}-{upper} GiB"
+
+# -- Standard modules --
+
+def get_os() -> str:
+    content = read_file("/etc/os-release")
+    if content:
+        for line in content.splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip('"\'')
+    return platform.system() or "Unknown"
+
+
+def get_kernel(paranoid: bool = False) -> str:
+    if paranoid:
+        return "Linux"
+    return platform.release() or "Unknown"
+
+
+def get_uptime() -> str:
+    raw = read_file("/proc/uptime")
+    if not raw:
+        return "Unknown"
+    try:
+        total_seconds = int(float(raw.split()[0]))
+    except (ValueError, IndexError):
+        return "Unknown"
+
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def get_memory(paranoid: bool = False) -> str:
+    content = read_file("/proc/meminfo")
+    if not content:
+        return "Unknown"
+
+    info: dict[str, int] = {}
+    for line in content.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        try:
+            info[key.strip()] = int(value.strip().split()[0])
+        except (ValueError, IndexError):
+            continue
+
+    total_kb = info.get("MemTotal", 0)
+    if total_kb == 0:
+        return "Unknown"
+
+    total_mib = total_kb // 1024
+
+    if paranoid:
+        return memory_range(total_mib)
+
+    available_kb = info.get("MemAvailable", info.get("MemFree", 0))
+    used_mib = (total_kb - available_kb) // 1024
+    return f"{used_mib} MiB / {total_mib} MiB"
+
+
+def get_cpu(paranoid: bool = False) -> str:
+    content = read_file("/proc/cpuinfo")
+    if not content:
+        return "Unknown"
+
+    full_name = "Unknown"
+    for needle in ("model name", "hardware", "processor"):
+        for line in content.splitlines():
+            if line.lower().startswith(needle):
+                _, _, value = line.partition(":")
+                name = value.strip()
+                if name:
+                    full_name = name
+                    break
+        if full_name != "Unknown":
+            break
+
+    if paranoid:
+        return extract_cpu_brand(full_name)
+    return full_name
+
+
+def get_shell() -> str:
+    shell = os.environ.get("SHELL", "")
+    if shell:
+        return os.path.basename(shell)
+    return "Unknown"
+
+
+# -- Custom modules --
+
+def get_gitpkg_packages() -> Optional[list[str]]:
+    """Fetch gitpkg package names from 'gitpkg list' output.
+
+    Expected format per line: '<name>  <commit_hash>'
+    Returns list of package names, or None if gitpkg unavailable.
+    """
+    output = run_cmd(["gitpkg", "list"])
+    if output is None:
+        return None
+    names: list[str] = []
+    for line in output.splitlines():
+        parts = line.split()
+        if parts:
+            names.append(parts[0])
+    return names
+
+
+def get_allocator() -> str:
+    """Detect memory allocator via ld.so.preload, LD_PRELOAD, and /proc/self/maps."""
+    sources = [
+        read_file("/etc/ld.so.preload") or "",
+        os.environ.get("LD_PRELOAD", ""),
+        read_file("/proc/self/maps") or "",  # catches LD_PRELOAD and direct linking
+    ]
+    if any("hardened_malloc" in source for source in sources):
+        return "hardened_malloc"
+    return "glibc (default)"
+
+
+# -- Output --
+
+def supports_color() -> bool:
+    """Conservative check for ANSI color support."""
+    if os.environ.get("NO_COLOR") is not None:  # https://no-color.org
+        return False
+    if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+        return False
+    return os.environ.get("TERM", "") != "dumb"
+
+
+def get_username() -> str:
+    """Get current username with fallbacks for containers / cron."""
+    name = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if name:
+        return name
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, OSError):
+        return "unknown"
+
+def has_atomic_upgrade(gitpkg_pkgs: Optional[list[str]]) -> bool:
+    """Check if atomic-upgrade is installed via gitpkg or pacman."""
+    if gitpkg_pkgs is not None and "atomic-upgrade" in gitpkg_pkgs:
+        return True
+
+    result = run_cmd(["pacman", "-Q", "atomic-upgrade"])
+    return result is not None
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="myfetch — minimal system info tool")
+    parser.add_argument(
+        "--paranoid",
+        action="store_true",
+        help="obscure identifying hardware details",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    paranoid = args.paranoid
+
+    if supports_color():
+        bold, cyan, magenta, reset = "\033[1m", "\033[36m", "\033[35m", "\033[0m"
+    else:
+        bold = cyan = magenta = reset = ""
+
+    user = get_username()
+    host = platform.node() or "unknown"
+
+    gitpkg_pkgs = get_gitpkg_packages()
+    gitpkg_count = str(len(gitpkg_pkgs)) if gitpkg_pkgs is not None else "N/A"
+
+    fields: list[tuple[str, str]] = [
+        ("OS",                 get_os()),
+        ("Kernel",             get_kernel(paranoid)),
+        ("Uptime",             get_uptime()),
+        ("Shell",              get_shell()),
+        ("CPU",                get_cpu(paranoid)),
+        ("Memory",             get_memory(paranoid)),
+        ("",                   ""),
+        ("Packages (gitpkg)",  gitpkg_count),
+        ("Allocator",          get_allocator()),
+        ("Atomic Upgrade",     "active" if has_atomic_upgrade(gitpkg_pkgs) else "not found"),
+    ]
+
+    header = f"{bold}{cyan}{user}{reset}@{bold}{magenta}{host}{reset}"
+    separator = "\u2500" * (len(user) + 1 + len(host))
+
+    print(header)
+    print(separator)
+    for key, value in fields:
+        if not key:
+            print()
+        else:
+            print(f"{bold}{cyan}{key:<20}{reset} {value}")
+
+
+if __name__ == "__main__":
+    main()
