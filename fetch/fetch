@@ -222,7 +222,7 @@ def has_atomic_upgrade(gitpkg_pkgs: Optional[list[str]]) -> bool:
     return result is not None
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="myfetch — minimal system info tool")
+    parser = argparse.ArgumentParser(description="fetch — minimal system info tool")
     parser.add_argument(
         "--paranoid",
         action="store_true",
