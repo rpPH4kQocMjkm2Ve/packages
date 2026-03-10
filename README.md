@@ -11,6 +11,9 @@ packages/
 ├── fetch/
 │   ├── Makefile
 │   └── ...
+├── btrfs-file-history/
+│   ├── Makefile
+│   └── ...
 └── .../
 ```
 
@@ -40,6 +43,7 @@ sudo make install
 | Package | Description |
 |---------|-------------|
 | [fetch](fetch/) | Minimal system information tool |
+| [btrfs-file-history](btrfs-file-history/) | Track file lifecycle across btrfs snapshots |
 
 ## Adding a package
 
