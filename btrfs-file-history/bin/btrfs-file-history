@@ -1,0 +1,7 @@
+#!/bin/bash
+exec python3 -B -c "
+import sys
+sys.path.insert(0, '/usr/lib/btrfs-file-history')
+from btrfs_file_history.cli import main
+main()
+" "$@"
