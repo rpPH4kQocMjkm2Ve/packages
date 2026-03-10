@@ -32,8 +32,8 @@ class FileState:
     inode: Optional[int] = None
     mode: Optional[int] = None
     checksum: Optional[str] = None
-    exclusive_bytes: Optional[int] = None   # btrfs filesystem du
-    shared_bytes: Optional[int] = None      # btrfs filesystem du
+    exclusive_bytes: Optional[int] = None
+    shared_bytes: Optional[int] = None
     extents: list[ExtentInfo] = field(default_factory=list)
 
     @property
@@ -52,7 +52,6 @@ class FileTransition:
     prev: Optional[FileState]
     curr: FileState
     change_type: str
-    # "created" | "modified" | "unchanged" | "deleted" | "type_changed"
 
 
 @dataclass
@@ -89,11 +88,7 @@ def _partial_checksum(
     path: Path,
     max_bytes: int = 64 * 1024,
 ) -> Optional[str]:
-    """Fast checksum of the first *max_bytes* using BLAKE2b.
-
-    Uses ``O_NOFOLLOW`` to stay consistent with ``lstat()`` used
-    elsewhere — never follows symlinks.
-    """
+    """Fast checksum of the first *max_bytes* using BLAKE2b."""
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
     except (OSError, PermissionError):
@@ -111,7 +106,7 @@ def _partial_checksum(
 
 
 def _stat_file(path: Path) -> Optional[os.stat_result]:
-    """``lstat`` a file, returning None on error."""
+    """lstat a file, returning None on error."""
     try:
         return os.lstat(str(path))
     except (OSError, PermissionError):
@@ -131,19 +126,8 @@ def probe_file(
     compute_extents: bool = False,
     compute_du: bool = False,
 ) -> FileState:
-    """Probe a single file inside one subvolume.
-
-    Used by :func:`scan_file` for bulk scanning and directly by
-    ``cmd_diff`` for targeted two-snapshot comparison.
-
-    Args:
-        relative_path: path relative to subvolume root
-        subvolume: the Subvolume object
-        subvol_base: resolved filesystem path to the subvolume root
-        compute_checksum: compute BLAKE2b of the first 64 KiB
-        compute_extents: collect extent map via filefrag
-        compute_du: collect ``btrfs filesystem du`` data
-    """
+    """Probe a single file inside one subvolume."""
+    relative_path = relative_path.lstrip("/")
     full_path = subvol_base / relative_path
 
     st = _stat_file(full_path)
@@ -188,25 +172,77 @@ def scan_file(
     compute_du: bool = False,
     subvol_filter: Optional[list[str]] = None,
 ) -> FileHistory:
-    """Scan a file in all accessible snapshots.
+    """Scan a file across snapshots of the relevant subvolume family.
 
-    Args:
-        relative_path: path relative to subvolume root (e.g. ``etc/fstab``)
-        tree: subvolume tree built from *mount_point*
-        mount_point: btrfs mount point
-        compute_checksum: compute BLAKE2b checksum for change detection
-        compute_extents: collect extent map via filefrag
-        compute_du: collect btrfs du (shared/exclusive bytes)
-        subvol_filter: only scan subvolumes matching these path fragments
+    Instead of scanning ALL subvolumes (which mixes unrelated ROOT
+    snapshots with home snapshots, causing false created/deleted
+    transitions), this function:
+
+    1. Does a quick probe across all accessible subvolumes to find
+       which ones contain the file.
+    2. Identifies the "family" of related subvolumes (original +
+       its snapshots) that contain the file.
+    3. Performs detailed scanning only within that family.
+
+    This ensures the timeline only shows transitions within the
+    same subvolume lineage, producing correct modified/unchanged
+    results instead of spurious created/deleted alternation.
     """
-    states: list[FileState] = []
+    relative_path = tree.normalize_file_path(relative_path)
+
+    # Phase 1: Quick existence check across all subvolumes
+    # to identify which family the file belongs to
+    candidate_families: dict[str, list[Subvolume]] = {}
+    # key = root ancestor uuid, value = family subvolumes that have the file
 
     for sv in tree.all_subvolumes:
         if subvol_filter:
             if not any(p in sv.path for p in subvol_filter):
                 continue
 
-        sv_base = tree.resolve_subvol_path(sv, mount_point)
+        sv_base = tree.resolve_subvol_path(sv)
+        if sv_base is None:
+            continue
+
+        test_path = sv_base / relative_path
+        if _stat_file(test_path) is not None:
+            # Find the root ancestor for this subvolume
+            root_ancestor = _find_root_ancestor(sv, tree)
+            root_uuid = root_ancestor.uuid
+            if root_uuid not in candidate_families:
+                candidate_families[root_uuid] = []
+            candidate_families[root_uuid].append(sv)
+
+    if not candidate_families:
+        # File not found anywhere — return empty history
+        return FileHistory(
+            relative_path=relative_path,
+            states=[],
+            transitions=[],
+        )
+
+    # Phase 2: Pick the best family (the one with most hits)
+    best_root_uuid = max(
+        candidate_families,
+        key=lambda k: len(candidate_families[k]),
+    )
+
+    # Get the full family (including subvolumes where file doesn't exist)
+    best_root = tree.by_uuid[best_root_uuid]
+    family = tree.get_family(best_root)
+
+    # Apply user filter if specified
+    if subvol_filter:
+        family = [
+            sv for sv in family
+            if any(p in sv.path for p in subvol_filter)
+        ]
+
+    # Phase 3: Detailed probe of the family subvolumes only
+    states: list[FileState] = []
+
+    for sv in family:
+        sv_base = tree.resolve_subvol_path(sv)
         if sv_base is None:
             continue
 
@@ -228,14 +264,27 @@ def scan_file(
     )
 
 
+def _find_root_ancestor(
+    sv: Subvolume, tree: SubvolumeTree,
+) -> Subvolume:
+    """Walk up the parent_uuid chain to find the root ancestor."""
+    current = sv
+    while (
+        current.is_snapshot
+        and current.parent_uuid
+        and current.parent_uuid in tree.by_uuid
+    ):
+        current = tree.by_uuid[current.parent_uuid]
+    return current
+
+
 def _compute_transitions(
     states: list[FileState],
     checksum_available: bool,
 ) -> list[FileTransition]:
     """Determine change type between consecutive states.
 
-    Skips all states before the file first appears — a file absent
-    in early snapshots is not marked as "deleted".
+    Skips all states before the file first appears.
     """
     transitions: list[FileTransition] = []
     prev_state: Optional[FileState] = None
@@ -284,7 +333,6 @@ def _detect_modification(
     checksum_available: bool,
 ) -> str:
     """Compare two existing file states to detect modifications."""
-    # Type change detection (file ↔ directory)
     if old.mode is not None and new.mode is not None:
         if stat.S_ISDIR(old.mode) != stat.S_ISDIR(new.mode):
             return "type_changed"
@@ -322,23 +370,17 @@ def _detect_modification(
 def find_shared_extents(
     history: FileHistory,
 ) -> dict[int, list[tuple[Subvolume, ExtentInfo]]]:
-    """Find physical extents shared across multiple file versions.
-
-    Filters out inline extents (stored in metadata, not data blocks)
-    which would produce false sharing results.
-    """
+    """Find physical extents shared across multiple file versions."""
     phys_map: dict[int, list[tuple[Subvolume, ExtentInfo]]] = {}
 
     for state in history.states:
         if not state.exists or not state.extents:
             continue
         for ext in state.extents:
-            # Skip inline extents — physical_offset is meaningless
             if "inline" in ext.flags.lower():
                 continue
             if ext.physical_offset == 0 and ext.length == 0:
                 continue
-
             phys_map.setdefault(ext.physical_offset, []).append(
                 (state.subvolume, ext)
             )

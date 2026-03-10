@@ -137,6 +137,8 @@ def cmd_diff(args: argparse.Namespace) -> None:
     mount = Path(args.mount_point)
     tree = _build_tree(str(mount))
 
+    file_path = tree.normalize_file_path(args.file_path)
+
     matches_old = tree.find_by_path(args.snap_old)
     matches_new = tree.find_by_path(args.snap_new)
 
@@ -156,8 +158,8 @@ def cmd_diff(args: argparse.Namespace) -> None:
     sv_old = matches_old[0]
     sv_new = matches_new[0]
 
-    sv_base_old = tree.resolve_subvol_path(sv_old, mount)
-    sv_base_new = tree.resolve_subvol_path(sv_new, mount)
+    sv_base_old = tree.resolve_subvol_path(sv_old)
+    sv_base_new = tree.resolve_subvol_path(sv_new)
 
     if sv_base_old is None:
         print(
@@ -175,14 +177,14 @@ def cmd_diff(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     state_old = probe_file(
-        args.file_path,
+        file_path,
         sv_old,
         sv_base_old,
         compute_checksum=True,
         compute_extents=True,
     )
     state_new = probe_file(
-        args.file_path,
+        file_path,
         sv_new,
         sv_base_new,
         compute_checksum=True,
@@ -268,7 +270,10 @@ def main() -> None:
     p_hist.add_argument("mount_point", help="btrfs mount point")
     p_hist.add_argument(
         "file_path",
-        help="File path relative to subvolume root",
+        help=(
+            "File path — absolute (e.g. /home/user/file) or "
+            "relative to subvolume root (e.g. user/file)"
+        ),
     )
     p_hist.add_argument(
         "--checksum",
@@ -310,7 +315,10 @@ def main() -> None:
     p_diff.add_argument("mount_point", help="btrfs mount point")
     p_diff.add_argument(
         "file_path",
-        help="File path relative to subvolume root",
+        help=(
+            "File path — absolute (e.g. /home/user/file) or "
+            "relative to subvolume root (e.g. user/file)"
+        ),
     )
     p_diff.add_argument(
         "snap_old", help="Old snapshot (path fragment)",
