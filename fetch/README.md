@@ -73,4 +73,4 @@ This package is part of the [gitpkg](../README.md) monorepo collection.
 
 ## License
 
-GPL-3.0
+AGPL-3.0-or-later
