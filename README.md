@@ -1,6 +1,6 @@
 # packages
 
-Collection repository for [gitpkg](https://gitlab.com/fkzys/gitpkg).
+Collection repository for [gitpkg](https://github.com/fkzys/gitpkg).
 
 ## Structure
 
